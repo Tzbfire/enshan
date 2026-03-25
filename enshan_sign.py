@@ -6,14 +6,25 @@ import re
 import random
 import requests
 import shutil
+import subprocess
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 # ================= 配置区域 =================
 CONFIG_FILE = "config.json"
+# 推送开关 (1=开启, 0=关闭)
+PUSH_SWITCH = os.getenv("ENSHAN_PUSH", "1")
 # ===========================================
 
 # 统一的 User-Agent
 USER_AGENT = "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+
+# 改用青龙推送
+try:
+    from notify import send as notify_send
+    print("✅ 成功加载青龙notify推送模块")
+except ImportError:
+    print("⚠️ 未找到notify模块，推送功能不可用（本地运行可忽略）")
+    notify_send = None
 
 def random_wait():
     """随机倒数函数 (0-900秒)"""
@@ -54,19 +65,6 @@ def save_cookie_to_config(new_cookie_str):
     except Exception as e:
         print(f"❌ 保存 Cookie 失败: {str(e)}")
 
-def push_pushplus(token, content):
-    if not token:
-        print("⚠️ 未配置 PUSHPLUS_TOKEN，跳过推送")
-        return
-        
-    url = "https://www.pushplus.plus/send"
-    data = {"token": token, "title": "恩山签到结果", "content": content}
-    try:
-        requests.post(url, json=data)
-        print("📨 PushPlus 通知已发送")
-    except Exception as e:
-        print(f"❌ 推送失败: {e}")
-
 def get_cookies_safe(page):
     try:
         ret = page.run_cdp('Network.getCookies')
@@ -92,7 +90,6 @@ def run_sign_in():
     if not config: return
     
     raw_cookie = config.get('cookie', '')
-    push_token = config.get('PUSHPLUS_TOKEN', '')
     user_uid = config.get('USER_UID', '')
     
     if not raw_cookie or not user_uid:
@@ -155,10 +152,17 @@ def run_sign_in():
     
     if not page:
         print("❌ 浏览器连续启动失败，放弃执行。")
-        push_pushplus(push_token, "恩山脚本错误: 浏览器连续启动失败 (v3.3)。请尝试重启青龙容器。")
+        # 参考sfsy.py的错误推送方式
+        if PUSH_SWITCH == "1" and notify_send:
+            notify_send("恩山脚本错误", "恩山脚本错误: 浏览器连续启动失败 (v3.3)。请尝试重启青龙容器。")
         # 清理临时目录
         shutil.rmtree(rand_dir, ignore_errors=True)
         return
+
+    # 初始化推送内容
+    notify_content = ""
+    sign_success = False
+    sign_msg = ""
 
     try:
         print("=== 开始执行恩山签到 (By Funseason - v3.3) ===")
@@ -199,8 +203,9 @@ def run_sign_in():
             try:
                 if "登录" in page.ele('tag:body').text:
                     print("❌ 严重错误: Cookie 已失效，变为游客状态。")
-                    push_pushplus(push_token, "恩山签到失败：Cookie 已失效，请更新 config.json。")
-                    return
+                    notify_content = "恩山签到失败：Cookie 已失效，请更新 config.json。"
+                    sign_success = False
+                    sign_msg = "Cookie失效"
             except: pass
         
         # 签到状态检测
@@ -211,19 +216,19 @@ def run_sign_in():
                 print("ℹ️ 状态: 今天已经签到过了。")
         except: pass
             
-        if not formhash and not is_signed:
+        if not formhash and not is_signed and not notify_content:
             print("❌ 错误: 无法提取 formhash")
-            push_pushplus(push_token, "恩山签到失败：无法提取 Formhash")
-            return
+            notify_content = "恩山签到失败：无法提取 Formhash"
+            sign_success = False
+            sign_msg = "Formhash缺失"
         
         if formhash:
             print(f"🔑 获取 Formhash 成功: {formhash}")
 
         # 7. 执行签到 (JS 注入)
-        sign_success = False
         sign_msg = "已签到"
         
-        if not is_signed:
+        if not is_signed and formhash and not notify_content:
             sign_api = "https://www.right.com.cn/forum/plugin.php?id=erling_qd:action&action=sign"
             print("🚀 正在发送签到请求...")
             js_code = f"""
@@ -243,16 +248,17 @@ def run_sign_in():
                     sign_success = True
                     sign_msg = result.get('message', '签到成功')
                 else:
+                    sign_success = False
                     sign_msg = result.get('message', '未知错误') if result else "接口无响应"
             except Exception as js_err:
                 print(f"❌ JS 执行异常: {js_err}")
                 sign_success = False
                 sign_msg = "JS执行失败或WAF拦截"
-        else:
+        elif is_signed:
             sign_success = True
 
         # 8. 最终数据获取与推送
-        if sign_success:
+        if sign_success and not notify_content:
             print("4. 正在获取最终积分数据...")
             
             # 8.1 获取签到数据
@@ -311,35 +317,33 @@ def run_sign_in():
             except Exception as e:
                 print(f"❌ 数据解析异常: {e}")
 
-            # 8.4 构建推送模版
+            # 8.4 构建推送内容 (使用纯文本，参考sfsy.py格式)
             notify_content = (
-                f"✅ 签到成功！🎊<br>"
-                f"📊 积分统计如下：<br>"
-                f"===========<br>"
-                f"今日积分：{today_points} <br>"
-                f"连续签到：{continuous_days} 天 <br>"
-                f"总签到天数：{total_days} 天 <br>"
-                f"总积分：{total_points} <br>"
-                f"贡献分：{contribution} 分 <br>"
+                f"✅ 签到成功！🎊\n"
+                f"📊 积分统计如下：\n"
+                f"===========\n"
+                f"今日积分：{today_points}\n"
+                f"连续签到：{continuous_days} 天\n"
+                f"总签到天数：{total_days} 天\n"
+                f"总积分：{total_points}\n"
+                f"贡献分：{contribution} 分\n"
                 f"恩山币：{enshan_coin} 币"
             )
             
             print("=== 推送内容预览 ===")
-            print(notify_content.replace("<br>", "\n"))
-            
-            push_pushplus(push_token, notify_content)
+            print(notify_content)
             
             final_cookies = get_cookies_safe(page)
             save_cookie_to_config(final_cookies)
             
-        else:
+        elif not sign_success and not notify_content:
             print("❌ 签到失败")
-            push_pushplus(push_token, f"❌ 恩山签到失败：{sign_msg}")
+            notify_content = f"❌ 恩山签到失败：{sign_msg}"
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        push_pushplus(push_token, f"恩山脚本运行出错: {str(e)}")
+        notify_content = f"恩山脚本运行出错: {str(e)}"
         
     finally:
         try:
@@ -352,6 +356,24 @@ def run_sign_in():
             shutil.rmtree(rand_dir, ignore_errors=True)
         except:
             pass
+    
+    # 推送执行结果 (改用青龙推送逻辑)
+    if notify_content:
+        if PUSH_SWITCH == "1":
+            print("📤 准备推送消息...")
+            try:
+                if notify_send:
+                    notify_send("恩山签到结果", notify_content)
+                    print("✅ 推送发送成功")
+                else:
+                    print("⚠️ 未找到notify模块，无法推送")
+            except Exception as e:
+                print(f"❌ 推送发送失败: {e}")
+        elif PUSH_SWITCH == "0":
+            print("ℹ️ 推送开关未开启 (ENSHAN_PUSH=0)")
+        else:
+            print(f"⚠️ 推送开关配置异常 (ENSHAN_PUSH={PUSH_SWITCH})，默认不推送")
+
 
 if __name__ == "__main__":
     run_sign_in()
